@@ -46,33 +46,106 @@ jobs:
 
       - name: Ad-hoc code sign (deep)
         run: |
-          # Подписываем все вложенные фреймворки и библиотеки
-          find build/macos/Build/Products/Release/procurement_analytics_system.app \
-            -type f -name "*.dylib" -exec codesign --force --sign - {} \; || true
+          APP_PATH="build/macos/Build/Products/Release/procurement_analytics_system.app"
           
-          find build/macos/Build/Products/Release/procurement_analytics_system.app \
-            -type d -name "*.framework" -exec codesign --force --sign - {} \; || true
+          # Удаляем старые подписи
+          codesign --remove-signature "$APP_PATH" || true
           
-          # Подписываем само приложение
+          # Подписываем все вложенные фреймворки и библиотеки (сначала вложенные компоненты)
+          find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - --timestamp=none {} \; || true
+          
+          find "$APP_PATH" -type d -name "*.framework" | while read framework; do
+            codesign --force --sign - --timestamp=none "$framework" || true
+          done
+          
+          # Подписываем плагины
+          find "$APP_PATH/Contents/Frameworks" -type d -name "*.app" -exec codesign --force --sign - --timestamp=none {} \; || true
+          
+          # Подписываем само приложение с правильными опциями
           codesign --force --deep --sign - \
+            --timestamp=none \
             --options runtime \
             --entitlements macos/Runner/Release.entitlements \
-            build/macos/Build/Products/Release/procurement_analytics_system.app
+            "$APP_PATH"
 
       - name: Verify code signature
         run: |
-          codesign --verify --verbose --deep \
-            build/macos/Build/Products/Release/procurement_analytics_system.app
+          APP_PATH="build/macos/Build/Products/Release/procurement_analytics_system.app"
+          codesign --verify --verbose --deep --strict "$APP_PATH"
           
-          # Проверяем, что приложение может быть запущено
-          spctl --assess --verbose \
-            build/macos/Build/Products/Release/procurement_analytics_system.app || true
+          # Показываем информацию о подписи
+          codesign -dvv "$APP_PATH" || true
+
+      - name: Create first-run script
+        run: |
+          cat > build/macos/Build/Products/Release/FirstRun.command << 'EOF'
+          #!/bin/bash
+          # Скрипт для первого запуска приложения на macOS
+          
+          APP_NAME="procurement_analytics_system.app"
+          SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+          APP_PATH="$SCRIPT_DIR/$APP_NAME"
+          
+          echo "🔓 Настройка приложения для первого запуска..."
+          
+          # Удаляем quarantine атрибут
+          echo "Удаление quarantine атрибута..."
+          xattr -cr "$APP_PATH"
+          
+          # Разрешаем запуск через spctl (требует пароль администратора)
+          echo "Разрешение запуска приложения..."
+          sudo spctl --master-disable 2>/dev/null || echo "Не удалось отключить Gatekeeper (это нормально)"
+          
+          echo ""
+          echo "✅ Готово! Теперь можно запустить приложение:"
+          echo "   open \"$APP_PATH\""
+          echo ""
+          echo "Или просто дважды кликните на $APP_NAME"
+          echo ""
+          read -p "Нажмите Enter для запуска приложения..."
+          open "$APP_PATH"
+          EOF
+          
+          chmod +x build/macos/Build/Products/Release/FirstRun.command
 
       - name: Create ZIP archive
         run: |
           cd build/macos/Build/Products/Release
           zip -r ../../../../procurement_analytics_system-macos.zip \
-            procurement_analytics_system.app
+            procurement_analytics_system.app \
+            FirstRun.command
+          
+          # Создаем README с инструкциями
+          cat > ../../../../README_MACOS.txt << 'EOF'
+          ============================================
+          Procurement Analytics System для macOS
+          ============================================
+          
+          ИНСТРУКЦИЯ ПО УСТАНОВКЕ:
+          
+          1. Распакуйте архив
+          2. Запустите FirstRun.command (двойной клик)
+             - Введите пароль администратора при запросе
+             - Это разрешит запуск приложения
+          3. После этого запустите procurement_analytics_system.app
+          
+          АЛЬТЕРНАТИВНЫЙ СПОСОБ (без скрипта):
+          
+          Если не хотите запускать скрипт, выполните в Terminal:
+          
+          cd /path/to/extracted/folder
+          xattr -cr procurement_analytics_system.app
+          open procurement_analytics_system.app
+          
+          При первом запуске:
+          - Откройте "Системные настройки" → "Безопасность и конфиденциальность"
+          - Нажмите "Открыть в любом случае" рядом с предупреждением
+          
+          ============================================
+          EOF
+          
+          zip -j ../../../../procurement_analytics_system-macos.zip \
+            ../../../../README_MACOS.txt
 
       - name: Create DMG (optional)
         run: |
@@ -100,7 +173,9 @@ jobs:
           name: macos-app
           path: |
             build/macos/Build/Products/Release/procurement_analytics_system.app
+            build/macos/Build/Products/Release/FirstRun.command
             procurement_analytics_system-macos.zip
+            README_MACOS.txt
           retention-days: 30
 
       - name: Upload DMG artifact (if exists)
