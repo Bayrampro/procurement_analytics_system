@@ -1,0 +1,125 @@
+name: Build macOS Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Generate code
+        run: flutter pub run build_runner build --delete-conflicting-outputs
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build macOS app (Release)
+        run: flutter build macos --release
+
+      - name: Remove quarantine attribute
+        run: |
+          xattr -cr build/macos/Build/Products/Release/procurement_analytics_system.app || true
+
+      - name: Ad-hoc code sign (deep)
+        run: |
+          # Подписываем все вложенные фреймворки и библиотеки
+          find build/macos/Build/Products/Release/procurement_analytics_system.app \
+            -type f -name "*.dylib" -exec codesign --force --sign - {} \; || true
+          
+          find build/macos/Build/Products/Release/procurement_analytics_system.app \
+            -type d -name "*.framework" -exec codesign --force --sign - {} \; || true
+          
+          # Подписываем само приложение
+          codesign --force --deep --sign - \
+            --options runtime \
+            --entitlements macos/Runner/Release.entitlements \
+            build/macos/Build/Products/Release/procurement_analytics_system.app
+
+      - name: Verify code signature
+        run: |
+          codesign --verify --verbose --deep \
+            build/macos/Build/Products/Release/procurement_analytics_system.app
+          
+          # Проверяем, что приложение может быть запущено
+          spctl --assess --verbose \
+            build/macos/Build/Products/Release/procurement_analytics_system.app || true
+
+      - name: Create ZIP archive
+        run: |
+          cd build/macos/Build/Products/Release
+          zip -r ../../../../procurement_analytics_system-macos.zip \
+            procurement_analytics_system.app
+
+      - name: Create DMG (optional)
+        run: |
+          # Install create-dmg if not available
+          if ! command -v create-dmg &> /dev/null; then
+            brew install create-dmg || echo "create-dmg not available, skipping DMG creation"
+          fi
+          
+          if command -v create-dmg &> /dev/null; then
+            create-dmg \
+              --volname "Procurement Analytics System" \
+              --window-pos 200 120 \
+              --window-size 800 400 \
+              --icon-size 100 \
+              --icon "procurement_analytics_system.app" 200 190 \
+              --hide-extension "procurement_analytics_system.app" \
+              --app-drop-link 600 185 \
+              "procurement_analytics_system-macos.dmg" \
+              "build/macos/Build/Products/Release/" || echo "DMG creation failed, continuing..."
+          fi
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: |
+            build/macos/Build/Products/Release/procurement_analytics_system.app
+            procurement_analytics_system-macos.zip
+          retention-days: 30
+
+      - name: Upload DMG artifact (if exists)
+        if: hashFiles('procurement_analytics_system-macos.dmg') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: procurement_analytics_system-macos.dmg
+          retention-days: 30
+
+      - name: Create Release (if tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/macos/Build/Products/Release/procurement_analytics_system.app
+            procurement_analytics_system-macos.zip
+            procurement_analytics_system-macos.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
